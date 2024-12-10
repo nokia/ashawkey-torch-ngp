@@ -73,10 +73,13 @@ class SHEncoder(nn.Module):
         return f"SHEncoder: input_dim={self.input_dim} degree={self.degree}"
     
     def forward(self, inputs, size=1):
-        # inputs: [..., input_dim], normalized real world positions in [-size, size]
+        # inputs: [..., input_dim], real world positions in [-size, size]
         # return: [..., degree^2]
 
         inputs = inputs / size # [-1, 1]
+
+        # normalize
+        inputs = inputs / torch.norm(inputs, dim=-1, keepdim=True) 
 
         prefix_shape = list(inputs.shape[:-1])
         inputs = inputs.reshape(-1, self.input_dim)

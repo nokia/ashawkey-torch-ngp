@@ -1,0 +1,89 @@
+Bootstrap: docker
+From: nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04
+
+
+
+%post
+
+    echo $PATH
+    # Set non-interactive mode to prevent prompts
+    export DEBIAN_FRONTEND=noninteractive
+    # Update and install prerequisites
+    apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        build-essential \
+        libssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        curl \
+        libncursesw5-dev \
+        xz-utils \
+        tk-dev \
+        libxml2-dev \
+        libxmlsec1-dev \
+        libffi-dev \
+        liblzma-dev \
+        ca-certificates \
+        ffmpeg \
+        libgl1-mesa-dev \
+        libgl1-mesa-glx \
+        libegl1-mesa \
+        libglib2.0-0 \
+        git \
+        software-properties-common \
+        cmake=3.22.* \
+        tzdata  # explicitly install tzdata to avoid timezone prompt
+    
+    ln -fs /usr/share/zoneinfo/UTC /etc/localtime
+    dpkg-reconfigure --frontend noninteractive tzdata
+
+    add-apt-repository ppa:deadsnakes/ppa -y
+    apt-get update && apt-get install -y python3.9 python3.9-venv python3.9-dev python3-pip
+
+    update-alternatives --remove python3 /usr/bin/python3.10
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 1
+    
+    
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+
+    python3 -m pip install --upgrade pip
+
+                
+    python3 -m  pip install --extra-index-url https://download.pytorch.org/whl/cu117 rich==13.8.1 \
+        tqdm==4.66.5 \
+        ninja==1.11.1.1 \
+        numpy==1.25.0 \
+        torch==1.13.0+cu117 torchvision==0.14.0+cu117 \
+        scipy==1.13.1 \
+        lpips==0.1.4 \
+        pandas==2.0.2 \
+        trimesh==4.4.9 \
+        PyMCubes==0.1.6 \
+        torch-ema==0.3 \
+        dearpygui==2.0.0\
+        packaging==23.1 \
+        matplotlib==3.7.1 \
+        tensorboardX==2.6.2.2 \
+        opencv-python==4.10.0.84 \
+        imageio==2.35.1 \
+        imageio-ffmpeg==0.5.1 \
+        pymeshlab==2023.12.post1 \
+        xatlas==0.0.9 \
+        torchmetrics==1.4.2 \
+        torch_efficient_distloss==0.1.3
+    python3 -m  pip install git+https://github.com/NVlabs/nvdiffrast/
+    
+
+%environment
+    export CUDA_HOME="/usr/local/cuda-11.7"
+    export PATH="/usr/local/cuda-11.7/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/cuda-11.7/lib64:$LD_LIBRARY_PATH"
+
+%runscript
+    exec "$@"
+
+

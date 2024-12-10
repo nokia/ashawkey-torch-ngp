@@ -6,11 +6,21 @@ import torch.nn as nn
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
 
-try:
-    import _raymarching as _backend
-except ImportError:
-    from .backend import _backend
+# lazy importing of CUDA module
+BACKEND = None
 
+def get_backend():
+    global BACKEND
+
+    if BACKEND is None:
+        try:
+            import _raymarching_mob as _backend
+        except ImportError:
+            from .backend import _backend
+
+        BACKEND = _backend
+    
+    return BACKEND
 
 # ----------------------------------------
 # utils
@@ -42,7 +52,7 @@ class _near_far_from_aabb(Function):
         nears = torch.empty(N, dtype=rays_o.dtype, device=rays_o.device)
         fars = torch.empty(N, dtype=rays_o.dtype, device=rays_o.device)
 
-        _backend.near_far_from_aabb(rays_o, rays_d, aabb, N, min_near, nears, fars)
+        get_backend().near_far_from_aabb(rays_o, rays_d, aabb, N, min_near, nears, fars)
 
         return nears, fars
 
@@ -73,12 +83,11 @@ class _sph_from_ray(Function):
 
         coords = torch.empty(N, 2, dtype=rays_o.dtype, device=rays_o.device)
 
-        _backend.sph_from_ray(rays_o, rays_d, radius, N, coords)
+        get_backend().sph_from_ray(rays_o, rays_d, radius, N, coords)
 
         return coords
 
 sph_from_ray = _sph_from_ray.apply
-
 
 class _morton3D(Function):
     @staticmethod
@@ -86,7 +95,7 @@ class _morton3D(Function):
         ''' morton3D, CUDA implementation
         Args:
             coords: [N, 3], int32, in [0, 128) (for some reason there is no uint32 tensor in torch...) 
-            TODO: check if the coord range is valid! (current 128 is safe)
+            ENHANCE: check if the coord range is valid! (current 128 is safe)
         Returns:
             indices: [N], int32, in [0, 128^3)
             
@@ -97,7 +106,7 @@ class _morton3D(Function):
 
         indices = torch.empty(N, dtype=torch.int32, device=coords.device)
         
-        _backend.morton3D(coords.int(), N, indices)
+        get_backend().morton3D(coords.int(), N, indices)
 
         return indices
 
@@ -119,7 +128,7 @@ class _morton3D_invert(Function):
 
         coords = torch.empty(N, 3, dtype=torch.int32, device=indices.device)
         
-        _backend.morton3D_invert(indices.int(), N, coords)
+        get_backend().morton3D_invert(indices.int(), N, coords)
 
         return coords
 
@@ -148,11 +157,35 @@ class _packbits(Function):
         if bitfield is None:
             bitfield = torch.empty(N, dtype=torch.uint8, device=grid.device)
 
-        _backend.packbits(grid, N, thresh, bitfield)
+        get_backend().packbits(grid, N, thresh, bitfield)
 
         return bitfield
 
 packbits = _packbits.apply
+
+
+class _flatten_rays(Function):
+    @staticmethod
+    def forward(ctx, rays, M):
+        ''' flatten rays
+        Args:
+            rays: [N, 2], all rays' (point_offset, point_count),
+            M: scalar, int, count of points (we cannot get this info from rays unfortunately...)
+        Returns:
+            res: [M], flattened ray index.
+        '''
+        if not rays.is_cuda: rays = rays.cuda()
+        rays = rays.contiguous()
+
+        N = rays.shape[0]
+
+        res = torch.zeros(M, dtype=torch.int, device=rays.device)
+
+        get_backend().flatten_rays(rays, N, M, res)
+
+        return res
+
+flatten_rays = _flatten_rays.apply
 
 # ----------------------------------------
 # train functions
@@ -161,7 +194,7 @@ packbits = _packbits.apply
 class _march_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, rays_o, rays_d, bound, density_bitfield, C, H, nears, fars, step_counter=None, mean_count=-1, perturb=False, align=-1, force_all_rays=False, dt_gamma=0, max_steps=1024):
+    def forward(ctx, rays_o, rays_d, bound, contract, density_bitfield, C, H, nears, fars, perturb=False, dt_gamma=0, max_steps=1024):
         ''' march rays to generate points (forward only)
         Args:
             rays_o/d: float, [N, 3]
@@ -180,57 +213,44 @@ class _march_rays_train(Function):
         Returns:
             xyzs: float, [M, 3], all generated points' coords. (all rays concated, need to use `rays` to extract points belonging to each ray)
             dirs: float, [M, 3], all generated points' view dirs.
-            deltas: float, [M, 2], all generated points' deltas. (first for RGB, second for Depth)
-            rays: int32, [N, 3], all rays' (index, point_offset, point_count), e.g., xyzs[rays[i, 1]:rays[i, 2]] --> points belonging to rays[i, 0]
+            ts: float, [M, 2], all generated points' ts.
+            rays: int32, [N, 2], all rays' (point_offset, point_count), e.g., xyzs[rays[i, 0]:(rays[i, 0] + rays[i, 1])] --> points belonging to rays[i, 0]
         '''
 
         if not rays_o.is_cuda: rays_o = rays_o.cuda()
         if not rays_d.is_cuda: rays_d = rays_d.cuda()
         if not density_bitfield.is_cuda: density_bitfield = density_bitfield.cuda()
         
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
+        rays_o = rays_o.float().contiguous().view(-1, 3)
+        rays_d = rays_d.float().contiguous().view(-1, 3)
         density_bitfield = density_bitfield.contiguous()
 
         N = rays_o.shape[0] # num rays
-        M = N * max_steps # init max points number in total
-
-        # running average based on previous epoch (mimic `measured_batch_size_before_compaction` in instant-ngp)
-        # It estimate the max points number to enable faster training, but will lead to random ignored rays if underestimated.
-        if not force_all_rays and mean_count > 0:
-            if align > 0:
-                mean_count += align - mean_count % align
-            M = mean_count
         
-        xyzs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
-        dirs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
-        deltas = torch.zeros(M, 2, dtype=rays_o.dtype, device=rays_o.device)
-        rays = torch.empty(N, 3, dtype=torch.int32, device=rays_o.device) # id, offset, num_steps
-
-        if step_counter is None:
-            step_counter = torch.zeros(2, dtype=torch.int32, device=rays_o.device) # point counter, ray counter
+        step_counter = torch.zeros(1, dtype=torch.int32, device=rays_o.device) # point counter, ray counter
         
         if perturb:
             noises = torch.rand(N, dtype=rays_o.dtype, device=rays_o.device)
         else:
             noises = torch.zeros(N, dtype=rays_o.dtype, device=rays_o.device)
         
-        _backend.march_rays_train(rays_o, rays_d, density_bitfield, bound, dt_gamma, max_steps, N, C, H, M, nears, fars, xyzs, dirs, deltas, rays, step_counter, noises) # m is the actually used points number
+        # first pass: write rays, get total number of points M to render
+        rays = torch.empty(N, 2, dtype=torch.int32, device=rays_o.device) # id, offset, num_steps
+        get_backend().march_rays_train(rays_o, rays_d, density_bitfield, bound, contract, dt_gamma, max_steps, N, C, H, nears, fars, None, None, None, rays, step_counter, noises)
 
-        #print(step_counter, M)
+        # allocate based on M
+        M = step_counter.item()
+        # print(M, N)
+        # print(rays[:, 0].max())
 
-        # only used at the first (few) epochs.
-        if force_all_rays or mean_count <= 0:
-            m = step_counter[0].item() # D2H copy
-            if align > 0:
-                m += align - m % align
-            xyzs = xyzs[:m]
-            dirs = dirs[:m]
-            deltas = deltas[:m]
+        xyzs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
+        dirs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
+        ts = torch.zeros(M, 2, dtype=rays_o.dtype, device=rays_o.device)
 
-            torch.cuda.empty_cache()
+        # second pass: write outputs
+        get_backend().march_rays_train(rays_o, rays_d, density_bitfield, bound, contract, dt_gamma, max_steps, N, C, H, nears, fars, xyzs, dirs, ts, rays, step_counter, noises)
 
-        return xyzs, dirs, deltas, rays
+        return xyzs, dirs, ts, rays
 
 march_rays_train = _march_rays_train.apply
 
@@ -238,54 +258,58 @@ march_rays_train = _march_rays_train.apply
 class _composite_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, sigmas, rgbs, deltas, rays, T_thresh=1e-4):
+    def forward(ctx, sigmas, rgbs, ts, rays, T_thresh=1e-4, alpha_mode=False):
         ''' composite rays' rgbs, according to the ray marching formula.
         Args:
             rgbs: float, [M, 3]
             sigmas: float, [M,]
-            deltas: float, [M, 2]
+            ts: float, [M, 2]
             rays: int32, [N, 3]
+            alpha_mode: bool, sigmas are treated as alphas instead
         Returns:
+            weights: float, [M]
             weights_sum: float, [N,], the alpha channel
             depth: float, [N, ], the Depth
             image: float, [N, 3], the RGB channel (after multiplying alpha!)
         '''
         
-        sigmas = sigmas.contiguous()
-        rgbs = rgbs.contiguous()
+        sigmas = sigmas.float().contiguous()
+        rgbs = rgbs.float().contiguous()
 
         M = sigmas.shape[0]
         N = rays.shape[0]
 
+        weights = torch.zeros(M, dtype=sigmas.dtype, device=sigmas.device) # may leave unmodified, so init with 0
         weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+
         depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
         image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
 
-        _backend.composite_rays_train_forward(sigmas, rgbs, deltas, rays, M, N, T_thresh, weights_sum, depth, image)
+        get_backend().composite_rays_train_forward(sigmas, rgbs, ts, rays, M, N, T_thresh, alpha_mode, weights, weights_sum, depth, image)
 
-        ctx.save_for_backward(sigmas, rgbs, deltas, rays, weights_sum, depth, image)
-        ctx.dims = [M, N, T_thresh]
+        ctx.save_for_backward(sigmas, rgbs, ts, rays, weights_sum, depth, image)
+        ctx.dims = [M, N, T_thresh, alpha_mode]
 
-        return weights_sum, depth, image
+        return weights, weights_sum, depth, image
     
     @staticmethod
     @custom_bwd
-    def backward(ctx, grad_weights_sum, grad_depth, grad_image):
-
-        # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
-
+    def backward(ctx, grad_weights, grad_weights_sum, grad_depth, grad_image):
+        
+        grad_weights = grad_weights.contiguous()
         grad_weights_sum = grad_weights_sum.contiguous()
+        grad_depth = grad_depth.contiguous()
         grad_image = grad_image.contiguous()
 
-        sigmas, rgbs, deltas, rays, weights_sum, depth, image = ctx.saved_tensors
-        M, N, T_thresh = ctx.dims
+        sigmas, rgbs, ts, rays, weights_sum, depth, image = ctx.saved_tensors
+        M, N, T_thresh, alpha_mode = ctx.dims
    
         grad_sigmas = torch.zeros_like(sigmas)
         grad_rgbs = torch.zeros_like(rgbs)
 
-        _backend.composite_rays_train_backward(grad_weights_sum, grad_image, sigmas, rgbs, deltas, rays, weights_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs)
+        get_backend().composite_rays_train_backward(grad_weights, grad_weights_sum, grad_depth, grad_image, sigmas, rgbs, ts, rays, weights_sum, depth, image, M, N, T_thresh, alpha_mode, grad_sigmas, grad_rgbs)
 
-        return grad_sigmas, grad_rgbs, None, None, None
+        return grad_sigmas, grad_rgbs, None, None, None, None
 
 
 composite_rays_train = _composite_rays_train.apply
@@ -297,7 +321,7 @@ composite_rays_train = _composite_rays_train.apply
 class _march_rays(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, density_bitfield, C, H, near, far, align=-1, perturb=False, dt_gamma=0, max_steps=1024):
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, contract, density_bitfield, C, H, near, far, perturb=False, dt_gamma=0, max_steps=1024):
         ''' march rays to generate points (forward only, for inference)
         Args:
             n_alive: int, number of alive rays
@@ -317,23 +341,20 @@ class _march_rays(Function):
         Returns:
             xyzs: float, [n_alive * n_step, 3], all generated points' coords
             dirs: float, [n_alive * n_step, 3], all generated points' view dirs.
-            deltas: float, [n_alive * n_step, 2], all generated points' deltas (here we record two deltas, the first is for RGB, the second for depth).
+            ts: float, [n_alive * n_step, 2], all generated points' ts
         '''
         
         if not rays_o.is_cuda: rays_o = rays_o.cuda()
         if not rays_d.is_cuda: rays_d = rays_d.cuda()
         
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
+        rays_o = rays_o.float().contiguous().view(-1, 3)
+        rays_d = rays_d.float().contiguous().view(-1, 3)
 
         M = n_alive * n_step
-
-        if align > 0:
-            M += align - (M % align)
         
         xyzs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
         dirs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
-        deltas = torch.zeros(M, 2, dtype=rays_o.dtype, device=rays_o.device) # 2 vals, one for rgb, one for depth
+        ts = torch.zeros(M, 2, dtype=rays_o.dtype, device=rays_o.device) # 2 vals, one for rgb, one for depth
 
         if perturb:
             # torch.manual_seed(perturb) # test_gui uses spp index as seed
@@ -341,9 +362,9 @@ class _march_rays(Function):
         else:
             noises = torch.zeros(n_alive, dtype=rays_o.dtype, device=rays_o.device)
 
-        _backend.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, dt_gamma, max_steps, C, H, density_bitfield, near, far, xyzs, dirs, deltas, noises)
+        get_backend().march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, bound, contract, dt_gamma, max_steps, C, H, density_bitfield, near, far, xyzs, dirs, ts, noises)
 
-        return xyzs, dirs, deltas
+        return xyzs, dirs, ts
 
 march_rays = _march_rays.apply
 
@@ -351,7 +372,7 @@ march_rays = _march_rays.apply
 class _composite_rays(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
-    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh=1e-2):
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, ts, weights_sum, depth, image, T_thresh=1e-2, alpha_mode=False):
         ''' composite rays' rgbs, according to the ray marching formula. (for inference)
         Args:
             n_alive: int, number of alive rays
@@ -360,13 +381,15 @@ class _composite_rays(Function):
             rays_t: float, [N], the alive rays' time
             sigmas: float, [n_alive * n_step,]
             rgbs: float, [n_alive * n_step, 3]
-            deltas: float, [n_alive * n_step, 2], all generated points' deltas (here we record two deltas, the first is for RGB, the second for depth).
+            ts: float, [n_alive * n_step, 2]
         In-place Outputs:
             weights_sum: float, [N,], the alpha channel
             depth: float, [N,], the depth value
             image: float, [N, 3], the RGB channel (after multiplying alpha!)
         '''
-        _backend.composite_rays(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image)
+        sigmas = sigmas.float().contiguous()
+        rgbs = rgbs.float().contiguous()
+        get_backend().composite_rays(n_alive, n_step, T_thresh, alpha_mode, rays_alive, rays_t, sigmas, rgbs, ts, weights_sum, depth, image)
         return tuple()
 
 

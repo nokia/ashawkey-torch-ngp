@@ -1,3 +1,7 @@
+#© 2024 Nokia
+#Licensed under the BSD 3 Clause license
+#SPDX-License-Identifier: BSD-3-Clause
+
 import os
 import glob
 import tqdm
@@ -6,31 +10,32 @@ import imageio
 import random
 import warnings
 import tensorboardX
+import wandb
 
 import numpy as np
-import pandas as pd
 
 import time
-from datetime import datetime
 
 import cv2
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+import torchvision
+
+try:
+    from torchmetrics.functional import structural_similarity_index_measure
+except: # old versions
+    from torchmetrics.functional import ssim as structural_similarity_index_measure
 
 import trimesh
-import mcubes
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
 from packaging import version as pver
 import lpips
-from torchmetrics.functional import structural_similarity_index_measure
 
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
@@ -39,48 +44,88 @@ def custom_meshgrid(*args):
     else:
         return torch.meshgrid(*args, indexing='ij')
 
+def create_dodecahedron_cameras(radius=1, center=np.array([0, 0, 0])):
 
-@torch.jit.script
-def linear_to_srgb(x):
-    return torch.where(x < 0.0031308, 12.92 * x, 1.055 * x ** 0.41666 - 0.055)
+    vertices = np.array([
+        -0.57735,  -0.57735,  0.57735,
+        0.934172,  0.356822,  0,
+        0.934172,  -0.356822,  0,
+        -0.934172,  0.356822,  0,
+        -0.934172,  -0.356822,  0,
+        0,  0.934172,  0.356822,
+        0,  0.934172,  -0.356822,
+        0.356822,  0,  -0.934172,
+        -0.356822,  0,  -0.934172,
+        0,  -0.934172,  -0.356822,
+        0,  -0.934172,  0.356822,
+        0.356822,  0,  0.934172,
+        -0.356822,  0,  0.934172,
+        0.57735,  0.57735,  -0.57735,
+        0.57735,  0.57735,  0.57735,
+        -0.57735,  0.57735,  -0.57735,
+        -0.57735,  0.57735,  0.57735,
+        0.57735,  -0.57735,  -0.57735,
+        0.57735,  -0.57735,  0.57735,
+        -0.57735,  -0.57735,  -0.57735,
+        ]).reshape((-1,3), order="C")
 
+    length = np.linalg.norm(vertices, axis=1).reshape((-1, 1))
+    vertices = vertices / length * radius + center
 
-@torch.jit.script
-def srgb_to_linear(x):
-    return torch.where(x < 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+    # construct camera poses by lookat
+    def normalize(x):
+        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
+
+    # forward is simple, notice that it is in fact the inversion of camera direction!
+    forward_vector = normalize(vertices - center)
+    # pick a temp up_vector, usually [0, 1, 0]
+    up_vector = np.array([0, 1, 0], dtype=np.float32)[None].repeat(forward_vector.shape[0], 0)
+    # cross(up, forward) --> right
+    right_vector = normalize(np.cross(up_vector, forward_vector, axis=-1))
+    # rectify up_vector, by cross(forward, right) --> up
+    up_vector = normalize(np.cross(forward_vector, right_vector, axis=-1))
+
+    ### construct c2w
+    poses = np.eye(4, dtype=np.float32)[None].repeat(forward_vector.shape[0], 0)
+    poses[:, :3, :3] = np.stack((right_vector, up_vector, forward_vector), axis=-1)
+    poses[:, :3, 3] = vertices
+
+    return poses
 
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
+def get_rays(poses, intrinsics, H, W, N=-1, patch_size=1, coords=None):
     ''' get rays
     Args:
-        poses: [B, 4, 4], cam2world
-        intrinsics: [4]
+        poses: [N/1, 4, 4], cam2world
+        intrinsics: [N/1, 4] tensor or [4] ndarray
         H, W, N: int
-        error_map: [B, 128 * 128], sample probability based on training error
     Returns:
-        rays_o, rays_d: [B, N, 3]
-        inds: [B, N]
+        rays_o, rays_d: [N, 3]
+        i, j: [N]
     '''
 
     device = poses.device
-    B = poses.shape[0]
-    fx, fy, cx, cy = intrinsics
+    
+    if isinstance(intrinsics, np.ndarray):
+        fx, fy, cx, cy = intrinsics
+    else:
+        fx, fy, cx, cy = intrinsics[:, 0], intrinsics[:, 1], intrinsics[:, 2], intrinsics[:, 3]
 
     i, j = custom_meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device)) # float
-    i = i.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
-    j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+    i = i.t().contiguous().view(-1) + 0.5
+    j = j.t().contiguous().view(-1) + 0.5
 
     results = {}
 
     if N > 0:
-        N = min(N, H*W)
+       
+        if coords is not None:
+            inds = coords[:, 0] * W + coords[:, 1]
 
-        # if use patch-based sampling, ignore error_map
-        if patch_size > 1:
+        elif patch_size > 1:
 
             # random sample left-top cores.
-            # NOTE: this impl will lead to less sampling on the image corner pixels... but I don't have other ideas.
             num_patch = N // (patch_size ** 2)
             inds_x = torch.randint(0, H - patch_size, size=[num_patch], device=device)
             inds_y = torch.randint(0, W - patch_size, size=[num_patch], device=device)
@@ -94,47 +139,53 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
             inds = inds.view(-1, 2) # [N, 2]
             inds = inds[:, 0] * W + inds[:, 1] # [N], flatten
 
-            inds = inds.expand([B, N])
 
-        elif error_map is None:
+        else: # random sampling
             inds = torch.randint(0, H*W, size=[N], device=device) # may duplicate
-            inds = inds.expand([B, N])
-        else:
-
-            # weighted sample on a low-reso grid
-            inds_coarse = torch.multinomial(error_map.to(device), N, replacement=False) # [B, N], but in [0, 128*128)
-
-            # map to the original resolution with random perturb.
-            inds_x, inds_y = inds_coarse // 128, inds_coarse % 128 # `//` will throw a warning in torch 1.10... anyway.
-            sx, sy = H / 128, W / 128
-            inds_x = (inds_x * sx + torch.rand(B, N, device=device) * sx).long().clamp(max=H - 1)
-            inds_y = (inds_y * sy + torch.rand(B, N, device=device) * sy).long().clamp(max=W - 1)
-            inds = inds_x * W + inds_y
-
-            results['inds_coarse'] = inds_coarse # need this when updating error_map
 
         i = torch.gather(i, -1, inds)
         j = torch.gather(j, -1, inds)
 
-        results['inds'] = inds
+        results['i'] = i.long()
+        results['j'] = j.long()
 
     else:
-        inds = torch.arange(H*W, device=device).expand([B, H*W])
+        inds = torch.arange(H*W, device=device)
 
-    zs = torch.ones_like(i)
-    xs = (i - cx) / fx * zs
-    ys = (j - cy) / fy * zs
-    directions = torch.stack((xs, ys, zs), dim=-1)
-    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
-    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3)
+    zs = -torch.ones_like(i) # z is flipped
+    xs = (i - cx) / fx
+    ys = -(j - cy) / fy # y is flipped
+    directions = torch.stack((xs, ys, zs), dim=-1) # [N, 3]
+    # do not normalize to get actual depth, ref: https://github.com/dunbar12138/DSNeRF/issues/29
+    # directions = directions / torch.norm(directions, dim=-1, keepdim=True) 
+    rays_d = (directions.unsqueeze(1) @ poses[:, :3, :3].transpose(-1, -2)).squeeze(1) # [N, 1, 3] @ [N, 3, 3] --> [N, 1, 3]
 
-    rays_o = poses[..., :3, 3] # [B, 3]
-    rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
+    rays_o = poses[:, :3, 3].expand_as(rays_d) # [N, 3]
 
     results['rays_o'] = rays_o
     results['rays_d'] = rays_d
 
+    # visualize_rays(rays_o[0].detach().cpu().numpy(), rays_d[0].detach().cpu().numpy())
+
     return results
+
+
+def visualize_rays(rays_o, rays_d):
+    
+    axes = trimesh.creation.axis(axis_length=4)
+    box = trimesh.primitives.Box(extents=(2, 2, 2)).as_outline()
+    box.colors = np.array([[128, 128, 128]] * len(box.entities))
+    objects = [axes, box]
+
+    for i in range(0, rays_o.shape[0], 10):
+        ro = rays_o[i]
+        rd = rays_d[i]
+
+        segs = np.array([[ro, ro + rd * 3]])
+        segs = trimesh.load_path(segs)
+        objects.append(segs)
+
+    trimesh.Scene(objects).show()
 
 
 def seed_everything(seed):
@@ -143,64 +194,8 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = True
-
-
-def torch_vis_2d(x, renormalize=False):
-    # x: [3, H, W] or [1, H, W] or [H, W]
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import torch
-    
-    if isinstance(x, torch.Tensor):
-        if len(x.shape) == 3:
-            x = x.permute(1,2,0).squeeze()
-        x = x.detach().cpu().numpy()
-        
-    print(f'[torch_vis_2d] {x.shape}, {x.dtype}, {x.min()} ~ {x.max()}')
-    
-    x = x.astype(np.float32)
-    
-    # renormalize
-    if renormalize:
-        x = (x - x.min(axis=0, keepdims=True)) / (x.max(axis=0, keepdims=True) - x.min(axis=0, keepdims=True) + 1e-8)
-
-    plt.imshow(x)
-    plt.show()
-
-
-def extract_fields(bound_min, bound_max, resolution, query_func, S=128):
-
-    X = torch.linspace(bound_min[0], bound_max[0], resolution).split(S)
-    Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(S)
-    Z = torch.linspace(bound_min[2], bound_max[2], resolution).split(S)
-
-    u = np.zeros([resolution, resolution, resolution], dtype=np.float32)
-    with torch.no_grad():
-        for xi, xs in enumerate(X):
-            for yi, ys in enumerate(Y):
-                for zi, zs in enumerate(Z):
-                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
-                    pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [S, 3]
-                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [S, 1] --> [x, y, z]
-                    u[xi * S: xi * S + len(xs), yi * S: yi * S + len(ys), zi * S: zi * S + len(zs)] = val
-    return u
-
-
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
-    #print('threshold: {}'.format(threshold))
-    u = extract_fields(bound_min, bound_max, resolution, query_func)
-
-    #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
-    
-    vertices, triangles = mcubes.marching_cubes(u, threshold)
-
-    b_max_np = bound_max.detach().cpu().numpy()
-    b_min_np = bound_min.detach().cpu().numpy()
-
-    vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
-    return vertices, triangles
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
 class PSNRMeter:
@@ -230,6 +225,8 @@ class PSNRMeter:
         self.V += psnr
         self.N += 1
 
+        return psnr
+
     def measure(self):
         return self.V / self.N
 
@@ -238,7 +235,52 @@ class PSNRMeter:
 
     def report(self):
         return f'PSNR = {self.measure():.6f}'
+    
+    def name(self):
+        return "PSNR"
 
+class LPIPSMeter:
+    def __init__(self, net='vgg', device=None):
+        self.V = 0
+        self.N = 0
+        self.net = net
+
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.fn = lpips.LPIPS(net=net).eval().to(self.device)
+
+    def clear(self):
+        self.V = 0
+        self.N = 0
+
+    def prepare_inputs(self, *inputs):
+        outputs = []
+        for i, inp in enumerate(inputs):
+            if len(inp.shape) == 3:
+                inp = inp.unsqueeze(0)
+            inp = inp.permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
+            inp = inp.to(self.device)
+            outputs.append(inp)
+        return outputs
+    
+    def update(self, preds, truths):
+        preds, truths = self.prepare_inputs(preds, truths) # [H, W, 3] --> [B, 3, H, W], range in [0, 1]
+        v = self.fn(truths, preds, normalize=True).item() # normalize=True: [0, 1] to [-1, 1]
+        self.V += v
+        self.N += 1
+
+        return v
+    
+    def measure(self):
+        return self.V / self.N
+
+    def write(self, writer, global_step, prefix=""):
+        writer.add_scalar(os.path.join(prefix, f"LPIPS ({self.net})"), self.measure(), global_step)
+
+    def report(self):
+        return f'LPIPS ({self.net}) = {self.measure():.6f}'
+    
+    def name(self):
+        return "LPIPS"
 
 class SSIMMeter:
     def __init__(self, device=None):
@@ -254,6 +296,8 @@ class SSIMMeter:
     def prepare_inputs(self, *inputs):
         outputs = []
         for i, inp in enumerate(inputs):
+            if len(inp.shape) == 3:
+                inp = inp.unsqueeze(0)
             inp = inp.permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
             inp = inp.to(self.device)
             outputs.append(inp)
@@ -275,43 +319,9 @@ class SSIMMeter:
 
     def report(self):
         return f'SSIM = {self.measure():.6f}'
-
-
-class LPIPSMeter:
-    def __init__(self, net='alex', device=None):
-        self.V = 0
-        self.N = 0
-        self.net = net
-
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.fn = lpips.LPIPS(net=net).eval().to(self.device)
-
-    def clear(self):
-        self.V = 0
-        self.N = 0
-
-    def prepare_inputs(self, *inputs):
-        outputs = []
-        for i, inp in enumerate(inputs):
-            inp = inp.permute(0, 3, 1, 2).contiguous() # [B, 3, H, W]
-            inp = inp.to(self.device)
-            outputs.append(inp)
-        return outputs
     
-    def update(self, preds, truths):
-        preds, truths = self.prepare_inputs(preds, truths) # [B, H, W, 3] --> [B, 3, H, W], range in [0, 1]
-        v = self.fn(truths, preds, normalize=True).item() # normalize=True: [0, 1] to [-1, 1]
-        self.V += v
-        self.N += 1
-    
-    def measure(self):
-        return self.V / self.N
-
-    def write(self, writer, global_step, prefix=""):
-        writer.add_scalar(os.path.join(prefix, f"LPIPS ({self.net})"), self.measure(), global_step)
-
-    def report(self):
-        return f'LPIPS ({self.net}) = {self.measure():.6f}'
+    def name(self):
+        return "SSIM"
 
 class Trainer(object):
     def __init__(self, 
@@ -329,6 +339,7 @@ class Trainer(object):
                  mute=False, # whether to mute all print
                  fp16=False, # amp optimize level
                  eval_interval=1, # eval once every $ epoch
+                 save_interval=1, # save once every $ epoch (independently from eval)
                  max_keep_ckpt=2, # max num of saved ckpts in disk
                  workspace='workspace', # workspace to save logs & ckpts
                  best_mode='min', # the smaller/larger result, the better
@@ -339,8 +350,8 @@ class Trainer(object):
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  ):
         
-        self.name = name
         self.opt = opt
+        self.name = name
         self.mute = mute
         self.metrics = metrics
         self.local_rank = local_rank
@@ -353,12 +364,26 @@ class Trainer(object):
         self.report_metric_at_train = report_metric_at_train
         self.max_keep_ckpt = max_keep_ckpt
         self.eval_interval = eval_interval
+        self.save_interval = save_interval
         self.use_checkpoint = use_checkpoint
         self.use_tensorboardX = use_tensorboardX
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+
+        # sampling parameters
+        self.tau = 1.0
+        self.val_timer = time.time()
+        self.accumulated_training_time = 0 # used to monitor training time (excluding evaluation time)
+        self.gt_saved = 0
+        self.max_memory_usage = 0 # used to create a memory monitoring when visualizing the training
+        self.cumulative_iteration_time = 0
+        self.n_iters = 0
+
+        # try out torch 2.0
+        if torch.__version__[0] == '2':
+            model = torch.compile(model)
 
         model.to(self.device)
         if self.world_size > 1:
@@ -370,20 +395,8 @@ class Trainer(object):
             criterion.to(self.device)
         self.criterion = criterion
 
-        # optionally use LPIPS loss for patch-based training
-        if self.opt.patch_size > 1:
-            import lpips
-            self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
-
-        if optimizer is None:
-            self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
-        else:
-            self.optimizer = optimizer(self.model)
-
-        if lr_scheduler is None:
-            self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
-        else:
-            self.lr_scheduler = lr_scheduler(self.optimizer)
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
 
         if ema_decay is not None:
             self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
@@ -422,7 +435,11 @@ class Trainer(object):
         self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
         self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
 
+        self.log(opt)
+        self.log(self.model)
+
         if self.workspace is not None:
+
             if self.use_checkpoint == "scratch":
                 self.log("[INFO] Training from scratch ...")
             elif self.use_checkpoint == "latest":
@@ -442,11 +459,9 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
         
-        # clip loss prepare
-        if opt.rand_pose >= 0: # =0 means only using CLIP loss, >0 means a hybrid mode.
-            from nerf.clip_utils import CLIPLoss
-            self.clip_loss = CLIPLoss(self.device)
-            self.clip_loss.prepare_text([self.opt.clip_text]) # only support one text prompt now...
+        self.opt.constant_memory_load = torch.cuda.memory_allocated()
+        self.opt.running_max_mem = 0
+        self.log(f"Constant Memory Usage (Bytes) = {self.opt.constant_memory_load}")
 
 
     def __del__(self):
@@ -467,165 +482,173 @@ class Trainer(object):
 
     def train_step(self, data):
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
+        rays_o = data['rays_o'] # [N, 3]
+        rays_d = data['rays_d'] # [N, 3]
+        index = data['index'] # [1/N]
+        cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
 
-        # if there is no gt image, we train with CLIP loss.
-        if 'images' not in data:
+        images = data['images'] # [N, 3/4]
 
-            B, N = rays_o.shape[:2]
-            H, W = data['H'], data['W']
+        N, C = images.shape
 
-            # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
-            pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
-
-            # [debug] uncomment to plot the images used in train_step
-            #torch_vis_2d(pred_rgb[0])
-
-            loss = self.clip_loss(pred_rgb)
-            
-            return pred_rgb, None, loss
-
-        images = data['images'] # [B, N, 3/4]
-
-        B, N, C = images.shape
-
-        if self.opt.color_space == 'linear':
-            images[..., :3] = srgb_to_linear(images[..., :3])
-
-        if C == 3 or self.model.bg_radius > 0:
+        if self.opt.background == 'random':
+            bg_color = torch.rand(N, 3, device=self.device) # [N, 3], pixel-wise random.
+        else: # white / last_sample
             bg_color = 1
-        # train with random background color if not using a bg model and has alpha channel.
-        else:
-            #bg_color = torch.ones(3, device=self.device) # [3], fixed white background
-            #bg_color = torch.rand(3, device=self.device) # [3], frame-wise random.
-            bg_color = torch.rand_like(images[..., :3]) # [N, 3], pixel-wise random.
 
         if C == 4:
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
-
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
-        # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
-    
-        pred_rgb = outputs['image']
+        
+        shading = 'diffuse' if self.global_step < self.opt.diffuse_step else 'full'
+        update_proposal = self.global_step <= 3000 or self.global_step % 5 == 0
+        
+        outputs = self.model.render(rays_o, rays_d, gt_image=gt_rgb, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, shading=shading, update_proposal=update_proposal, step=self.global_step)
 
         # MSE loss
-        loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
-
-        # patch-based rendering
-        if self.opt.patch_size > 1:
-            gt_rgb = gt_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-            pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-
-            # torch_vis_2d(gt_rgb[0])
-            # torch_vis_2d(pred_rgb[0])
-
-            # LPIPS loss [not useful...]
-            loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
-
-        # special case for CCNeRF's rank-residual training
-        if len(loss.shape) == 3: # [K, B, N]
-            loss = loss.mean(0)
-
-        # update error_map
-        if self.error_map is not None:
-            index = data['index'] # [B]
-            inds = data['inds_coarse'] # [B, N]
-
-            # take out, this is an advanced indexing and the copy is unavoidable.
-            error_map = self.error_map[index] # [B, H * W]
-
-            # [debug] uncomment to save and visualize error map
-            # if self.global_step % 1001 == 0:
-            #     tmp = error_map[0].view(128, 128).cpu().numpy()
-            #     print(f'[write error map] {tmp.shape} {tmp.min()} ~ {tmp.max()}')
-            #     tmp = (tmp - tmp.min()) / (tmp.max() - tmp.min())
-            #     cv2.imwrite(os.path.join(self.workspace, f'{self.global_step}.jpg'), (tmp * 255).astype(np.uint8))
-
-            error = loss.detach().to(error_map.device) # [B, N], already in [0, 1]
-            
-            # ema update
-            ema_error = 0.1 * error_map.gather(1, inds) + 0.9 * error
-            error_map.scatter_(1, inds, ema_error)
-
-            # put back
-            self.error_map[index] = error_map
-
+        pred_rgb = outputs['image']
+        loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [N, 3] --> [N]
         loss = loss.mean()
 
-        # extra loss
-        # pred_weights_sum = outputs['weights_sum'] + 1e-8
-        # loss_ws = - 1e-1 * pred_weights_sum * torch.log(pred_weights_sum) # entropy to encourage weights_sum to be 0 or 1.
-        # loss = loss + loss_ws.mean()
+        if self.opt.wandb:
+            wandb.log({"rgb loss" : loss}, step=self.global_step)
 
+
+        # proposal loss to update the samplers in nerfacto
+        if 'proposal_loss' in outputs and self.opt.lambda_proposal > 0:
+            if self.opt.wandb:
+                wandb.log({"proposal loss" : self.opt.lambda_proposal * outputs['proposal_loss'].mean()}, step=self.global_step)
+            loss = loss + self.opt.lambda_proposal * outputs['proposal_loss']
+
+        # extra loss
+        if 'distort_loss' in outputs and self.opt.lambda_distort > 0:
+            loss = loss + self.opt.lambda_distort * outputs['distort_loss']
+
+        if self.opt.lambda_entropy > 0:
+            w = outputs['weights_sum'].clamp(1e-5, 1 - 1e-5)
+            entropy = - w * torch.log2(w) - (1 - w) * torch.log2(1 - w)
+            loss = loss + self.opt.lambda_entropy * (entropy.mean())
+
+        # adaptive num_rays
+        if self.opt.adaptive_num_rays:
+            self.opt.num_rays = int(round((self.opt.num_points / outputs['num_points']) * self.opt.num_rays))
+            
         return pred_rgb, gt_rgb, loss
+    
+
+    def hsm_train_step(self, data):
+        
+        rays_o = data['rays_o'] # [N, 3]
+        rays_d = data['rays_d'] # [N, 3]
+        index = data['index'] # [1/N]
+        cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
+
+        images = data['images'] # [N, 3/4]
+
+        N, C = images.shape
+
+        if self.opt.background == 'random':
+            bg_color = torch.rand(N, 3, device=self.device) # [N, 3], pixel-wise random.
+        else: # white / last_sample
+            bg_color = 1
+
+        if C == 4:
+            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+        else:
+            gt_rgb = images
+        
+        shading = 'diffuse' if self.global_step < self.opt.diffuse_step else 'full'
+        if shading != 'full':
+            # Throw a warning only once
+            warnings.warn("Shading is not to 'full' is not tested with hard sample mining.", UserWarning)
+        if self.opt.O:
+            output, output_gradient = self.model.run_hsm(rays_o, rays_d, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, shading=shading, gt_image=gt_rgb, global_step=self.global_step)
+        if self.opt.O2:
+            update_proposal = self.global_step <= 3000 or self.global_step % 5 == 0
+            output, output_gradient, prop_loss = self.model.run_hsm2(rays_o, rays_d, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, shading=shading, gt_image=gt_rgb, update_proposal=update_proposal, global_step=self.global_step)
+            if update_proposal:
+                if self.opt.wandb:
+                    wandb.log({"proposal loss" : prop_loss}, step=self.global_step)
+                self.scaler.scale(prop_loss).backward() # proposal samplers form a separate graph
+        
+        self.scaler.scale(output).backward(gradient=output_gradient)
+        self.post_train_step() # for TV loss...
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+
+    def post_train_step(self):
+
+        # unscale grad before modifying it!
+        # ref: https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
+        self.scaler.unscale_(self.optimizer)
+
+        # the new inplace TV loss
+        if self.opt.lambda_tv > 0:
+            self.model.apply_total_variation(self.opt.lambda_tv)
+        
+        if self.opt.lambda_wd > 0:
+            self.model.apply_weight_decay(self.opt.lambda_wd)
+                
 
     def eval_step(self, data):
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
-        images = data['images'] # [B, H, W, 3/4]
-        B, H, W, C = images.shape
+        rays_o = data['rays_o'] # [N, 3]
+        rays_d = data['rays_d'] # [N, 3]
+        images = data['images'] # [H, W, 3/4]
+        index = data['index'] # [1/N]
+        H, W, C = images.shape
 
-        if self.opt.color_space == 'linear':
-            images[..., :3] = srgb_to_linear(images[..., :3])
+        cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
 
-        # eval with fixed background color
+        # eval with fixed white background color
         bg_color = 1
         if C == 4:
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far)
 
-        pred_rgb = outputs['image'].reshape(B, H, W, 3)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+        pred_rgb = outputs['image'].reshape(H, W, 3)
+        pred_depth = outputs['depth'].reshape(H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
 
         return pred_rgb, pred_depth, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False):  
+    def test_step(self, data, bg_color=None, perturb=False, shading='full'):  
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
+        rays_o = data['rays_o'] # [N, 3]
+        rays_d = data['rays_d'] # [N, 3]
+        index = data['index'] # [1/N]
         H, W = data['H'], data['W']
+
+        cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
 
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, index=index, bg_color=bg_color, perturb=perturb, cam_near_far=cam_near_far, shading=shading)
 
-        pred_rgb = outputs['image'].reshape(-1, H, W, 3)
-        pred_depth = outputs['depth'].reshape(-1, H, W)
+        pred_rgb = outputs['image'].reshape(H, W, 3)
+        pred_depth = outputs['depth'].reshape(H, W)
 
         return pred_rgb, pred_depth
 
 
-    def save_mesh(self, save_path=None, resolution=256, threshold=10):
+    def save_mesh(self, save_path=None, resolution=128, decimate_target=1e5, dataset=None):
 
         if save_path is None:
-            save_path = os.path.join(self.workspace, 'meshes', f'{self.name}_{self.epoch}.ply')
+            save_path = os.path.join(self.workspace, 'mesh')
 
         self.log(f"==> Saving mesh to {save_path}")
 
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        os.makedirs(save_path, exist_ok=True)
 
-        def query_func(pts):
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    sigma = self.model.density(pts.to(self.device))['sigma']
-            return sigma
-
-        vertices, triangles = extract_geometry(self.model.aabb_infer[:3], self.model.aabb_infer[3:], resolution=resolution, threshold=threshold, query_func=query_func)
-
-        mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
-        mesh.export(save_path)
+        self.model.export_mesh(save_path, resolution=resolution, decimate_target=decimate_target, dataset=dataset)
 
         self.log(f"==> Finished saving mesh.")
 
@@ -636,23 +659,22 @@ class Trainer(object):
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
 
         # mark untrained region (i.e., not covered by any camera from the training dataset)
-        if self.model.cuda_ray:
-            self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
+        if self.opt.mark_untrained:
+            self.model.mark_untrained_grid(train_loader._data)
 
-        # get a ref to error_map
-        self.error_map = train_loader._data.error_map
-        
+        start_t = time.time()
+        self.val_timer = time.time() # start validation timer
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
-
-            self.train_one_epoch(train_loader)
-
-            if self.workspace is not None and self.local_rank == 0:
+            ret_code = self.train_one_epoch(train_loader, valid_loader=valid_loader)
+            if ret_code==0:
+                print(f"Accumulated training time: {self.accumulated_training_time} seconds")
                 self.save_checkpoint(full=True, best=False)
+                break
 
-            if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader)
-                self.save_checkpoint(full=False, best=True)
+        end_t = time.time()
+
+        self.log(f"[INFO] training takes {(end_t - start_t)/ 60:.6f} minutes.")
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
@@ -685,16 +707,12 @@ class Trainer(object):
 
             for i, data in enumerate(loader):
                 
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
-
-                if self.opt.color_space == 'linear':
-                    preds = linear_to_srgb(preds)
-
-                pred = preds[0].detach().cpu().numpy()
+                preds, preds_depth = self.test_step(data)
+                pred = preds.detach().cpu().numpy()
                 pred = (pred * 255).astype(np.uint8)
 
-                pred_depth = preds_depth[0].detach().cpu().numpy()
+                pred_depth = preds_depth.detach().cpu().numpy()
+                pred_depth = (pred_depth - pred_depth.min()) / (pred_depth.max() - pred_depth.min() + 1e-6)
                 pred_depth = (pred_depth * 255).astype(np.uint8)
 
                 if write_video:
@@ -707,10 +725,15 @@ class Trainer(object):
                 pbar.update(loader.batch_size)
         
         if write_video:
-            all_preds = np.stack(all_preds, axis=0)
-            all_preds_depth = np.stack(all_preds_depth, axis=0)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+            all_preds = np.stack(all_preds, axis=0) # [N, H, W, 3]
+            all_preds_depth = np.stack(all_preds_depth, axis=0) # [N, H, W]
+
+            # fix ffmpeg not divisible by 2
+            all_preds = np.pad(all_preds, ((0, 0), (0, 1 if all_preds.shape[1] % 2 != 0 else 0), (0, 1 if all_preds.shape[2] % 2 != 0 else 0), (0, 0)))
+            all_preds_depth = np.pad(all_preds_depth, ((0, 0), (0, 1 if all_preds_depth.shape[1] % 2 != 0 else 0), (0, 1 if all_preds_depth.shape[2] % 2 != 0 else 0)))
+
+            imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=24, quality=8, macro_block_size=1)
+            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=24, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
     
@@ -724,8 +747,8 @@ class Trainer(object):
         loader = iter(train_loader)
 
         # mark untrained grid
-        if self.global_step == 0:
-            self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
+        if self.global_step == 0 and self.opt.mark_untrained:
+            self.model.mark_untrained_grid(train_loader._data)
 
         for _ in range(step):
             
@@ -738,24 +761,27 @@ class Trainer(object):
 
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
+                self.model.update_extra_state()            
             
             self.global_step += 1
 
             self.optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+            preds, truths, loss_net = self.train_step(data)
+            
+            loss = loss_net
          
             self.scaler.scale(loss).backward()
+
+            self.post_train_step() # for TV loss...
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
-            total_loss += loss.detach()
+            total_loss += loss_net.detach()
 
         if self.ema is not None:
             self.ema.update()
@@ -777,7 +803,7 @@ class Trainer(object):
 
     
     # [GUI] test on a single image
-    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1):
+    def test_gui(self, pose, intrinsics, mvp, W, H, bg_color=None, spp=1, downscale=1, shading='full'):
         
         # render resolution (may need downscale to for better frame rate)
         rH = int(H * downscale)
@@ -789,10 +815,12 @@ class Trainer(object):
         rays = get_rays(pose, intrinsics, rH, rW, -1)
 
         data = {
+            'mvp': mvp,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
             'H': rH,
             'W': rW,
+            'index': [0],
         }
         
         self.model.eval()
@@ -802,9 +830,8 @@ class Trainer(object):
             self.ema.copy_to()
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                # here spp is used as perturb random seed! (but not perturb the first sample)
-                preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
+            # here spp is used as perturb random seed! (but not perturb the first sample)
+            preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp, shading=shading)
 
         if self.ema is not None:
             self.ema.restore()
@@ -812,14 +839,11 @@ class Trainer(object):
         # interpolation to the original resolution
         if downscale != 1:
             # TODO: have to permute twice with torch...
-            preds = F.interpolate(preds.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
-            preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
+            preds = F.interpolate(preds.unsqueeze(0).permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).squeeze(0).contiguous()
+            preds_depth = F.interpolate(preds_depth.unsqueeze(0).unsqueeze(1), size=(H, W), mode='nearest').squeeze(0).squeeze(1)
 
-        if self.opt.color_space == 'linear':
-            preds = linear_to_srgb(preds)
-
-        pred = preds[0].detach().cpu().numpy()
-        pred_depth = preds_depth[0].detach().cpu().numpy()
+        pred = preds.detach().cpu().numpy()
+        pred_depth = preds_depth.detach().cpu().numpy()
 
         outputs = {
             'image': pred,
@@ -827,8 +851,54 @@ class Trainer(object):
         }
 
         return outputs
+    
+    def get_b_sample(self, ranking_metric, b):
+        probs = ranking_metric
+        return torch.multinomial(probs, b, replacement=False)
 
-    def train_one_epoch(self, loader):
+
+    def mask_data(self, data, mask_indices):
+
+        for key in data.keys():
+            if (not isinstance(data[key], int)) and len(data[key]) > 1:
+                data[key] = data[key][mask_indices]
+
+
+        return data
+
+    def non_maximum_supression(self, data, loss):
+        # data["i"] is of size N
+        box_side_in_pixels = 10
+        boxes = torch.cat([(data["i"].unsqueeze(-1)-box_side_in_pixels).clamp(min=0),
+                            (data["j"].unsqueeze(-1)-box_side_in_pixels).clamp(min=0),
+                              data["i"].unsqueeze(-1)+box_side_in_pixels,
+                                data["j"].unsqueeze(-1)+box_side_in_pixels], dim=1).float() + (data["index"] * max(data["H"], data["W"])).unsqueeze(-1) # torch.norm(data["rays_o"], dim=1, keepdim=True)*100 # should be [N,4]
+        return torchvision.ops.batched_nms(boxes, loss, data['index'].int(), 0.7)
+        # return torchvision.ops.nms(boxes, loss, 0.8) # non-batch version is faster
+
+
+    def eval_timestep(self, valid_loader):
+        # checkpoint monitor
+        if ((time.time() - self.val_timer) >  self.opt.val_checkpoint) and self.opt.eval_cnt != -1:
+            training_time = (time.time() - self.val_timer)
+            self.accumulated_training_time += training_time
+            self.log(f"Average Training Speed (Iterations per Second) = {self.n_iters / training_time}")
+            self.log(f"Running Max Memory Usage (MB) = {self.opt.running_max_mem}")
+            if self.opt.wandb:
+                wandb.log({"training time" : self.accumulated_training_time, "Running Max Memory Usage (MB)" : self.opt.running_max_mem}, step=self.global_step)
+            self.model.eval()
+            self.evaluate_one_epoch(valid_loader)
+            self.save_checkpoint(full=True, best=False)
+            self.n_iters = 0 # reset iteration counter
+            self.opt.running_max_mem = 0 # reset memory usage
+            self.model.train()
+            self.val_timer = time.time() # reset validation timer
+            torch.cuda.reset_peak_memory_stats() # do not monitor eval memory
+
+    
+    
+    
+    def train_one_epoch(self, loader, valid_loader=None):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
@@ -849,28 +919,51 @@ class Trainer(object):
         self.local_step = 0
 
         for data in loader:
-            
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    self.model.update_extra_state()
+                self.model.update_extra_state()
                     
             self.local_step += 1
             self.global_step += 1
+            self.n_iters += 1
 
-            self.optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
-            self.scaler.scale(loss).backward()
+            self.optimizer.zero_grad()    
+
+            # forward pass
+            if self.opt.hsm:
+                self.hsm_train_step(data)
+
+                if self.scheduler_update_every_step:
+                    self.lr_scheduler.step()
+                
+                if self.opt.wandb:
+                    wandb.log({"Max memory used per iteration (MB)" : (torch.cuda.max_memory_allocated()-self.opt.constant_memory_load)/1e6}, step=self.global_step)
+                
+                pbar.set_description(f"Memory Used={(torch.cuda.max_memory_allocated()-self.opt.constant_memory_load)/1e6:.0f} MB")
+                self.opt.running_max_mem = max(torch.cuda.max_memory_allocated(), self.opt.running_max_mem)
+                pbar.update(loader.batch_size)
+                
+                self.eval_timestep(valid_loader=valid_loader)
+                torch.cuda.reset_peak_memory_stats()
+                if (self.accumulated_training_time / 60) >= self.opt.max_training_time:
+                    return 0
+                continue
+            
+            preds, truths, loss = self.train_step(data)
+            # backward pass
+            self.scaler.scale(loss.mean()).backward()
+            self.post_train_step() # for TV loss...
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
+
+
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
-            loss_val = loss.item()
+            loss_val = loss.mean().item()
             total_loss += loss_val
 
             if self.local_rank == 0:
@@ -883,10 +976,21 @@ class Trainer(object):
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_val:.6f} ({total_loss/self.local_step:.6f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    pbar.set_description(f"loss={loss_val:.6f} ({total_loss/self.local_step:.6f})")
                 pbar.update(loader.batch_size)
+
+            pbar.set_description(f"Memory Used={(torch.cuda.max_memory_allocated()-self.opt.constant_memory_load)/1e6:.0f} MB")
+            if self.opt.wandb:
+                wandb.log({"Max memory used per iteration (MB)" : (torch.cuda.max_memory_allocated()-self.opt.constant_memory_load)/1e6}, step=self.global_step)
+            
+            self.opt.running_max_mem = max(torch.cuda.max_memory_allocated(), self.opt.running_max_mem)
+            self.eval_timestep(valid_loader=valid_loader)
+            torch.cuda.reset_peak_memory_stats()
+            if (self.accumulated_training_time / 60) >= self.opt.max_training_time:
+                return 0
+
 
         if self.ema is not None:
             self.ema.update()
@@ -909,8 +1013,8 @@ class Trainer(object):
             else:
                 self.lr_scheduler.step()
 
-        self.log(f"==> Finished Epoch {self.epoch}.")
-
+        self.log(f"==> Finished Epoch {self.epoch}, loss={average_loss:.6f}.")
+        return 1
 
     def evaluate_one_epoch(self, loader, name=None):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
@@ -935,11 +1039,13 @@ class Trainer(object):
         with torch.no_grad():
             self.local_step = 0
 
-            for data in loader:    
+            for data in loader:
                 self.local_step += 1
 
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                if self.opt.val_img!=-1 and self.local_step!=self.opt.val_img:
+                    continue
+
+                preds, preds_depth, truths, loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -963,38 +1069,54 @@ class Trainer(object):
 
                 # only rank = 0 will perform evaluation.
                 if self.local_rank == 0:
-
+                    
+                    metric_vals = []
                     for metric in self.metrics:
-                        metric.update(preds, truths)
+                        metric_val = metric.update(preds, truths)
+                        metric_vals.append(metric_val)
 
                     # save image
-                    save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
-                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                    save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_{int(self.accumulated_training_time):04d}_rgb.png')
+                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_{int(self.accumulated_training_time):04d}_depth.png')
+                    save_path_error = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_{int(self.accumulated_training_time):04d}_error_{metric_vals[0]:.2f}.png') # metric_vals[0] should be the PSNR
 
                     #self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-                    if self.opt.color_space == 'linear':
-                        preds = linear_to_srgb(preds)
-
-                    pred = preds[0].detach().cpu().numpy()
+                    pred = preds.detach().cpu().numpy()
                     pred = (pred * 255).astype(np.uint8)
 
-                    pred_depth = preds_depth[0].detach().cpu().numpy()
+                    pred_depth = preds_depth.detach().cpu().numpy()
+                    pred_depth = (pred_depth - pred_depth.min()) / (pred_depth.max() - pred_depth.min() + 1e-6)
                     pred_depth = (pred_depth * 255).astype(np.uint8)
+
+                    truth = truths.detach().cpu().numpy()
+                    truth = (truth * 255).astype(np.uint8)
+                    error = np.abs(truth.astype(np.float32) - pred.astype(np.float32)).mean(-1).astype(np.uint8)
                     
+                    if not self.gt_saved:
+                        # truth = (truth * 255).astype(np.uint8)
+                        gt_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.local_step:04d}_gt_rgb.png')
+                        cv2.imwrite(gt_path, cv2.cvtColor(truth, cv2.COLOR_RGB2BGR))
+
+
+
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(save_path_depth, pred_depth)
+                    cv2.imwrite(save_path_error, error)
 
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                    pbar.set_description(f"loss={loss_val:.6f} ({total_loss/self.local_step:.6f})")
                     pbar.update(loader.batch_size)
 
 
         average_loss = total_loss / self.local_step
         self.stats["valid_loss"].append(average_loss)
 
+        self.gt_saved = 1 # save gt only once in the beginning
+
         if self.local_rank == 0:
             pbar.close()
+            
             if not self.use_loss_as_metric and len(self.metrics) > 0:
                 result = self.metrics[0].measure()
                 self.stats["results"].append(result if self.best_mode == 'min' else - result) # if max mode, use -result
@@ -1003,6 +1125,10 @@ class Trainer(object):
 
             for metric in self.metrics:
                 self.log(metric.report(), style="blue")
+                if self.opt.wandb:
+                    wandb.log({f"{metric.name()}" : metric.measure(), "training time" : int(self.accumulated_training_time)}, step=self.global_step)
+                    wandb.log({f"{metric.name()} per iteration" : metric.measure()}, step=self.global_step)
+                    wandb.log({"Max Memory Usage (Bytes)": self.max_memory_usage, "training time" : int(self.accumulated_training_time)}, step=self.global_step)
                 if self.use_tensorboardX:
                     metric.write(self.writer, self.epoch, prefix="evaluate")
                 metric.clear()
@@ -1011,6 +1137,7 @@ class Trainer(object):
             self.ema.restore()
 
         self.log(f"++> Evaluate epoch {self.epoch} Finished.")
+        return average_loss
 
     def save_checkpoint(self, name=None, full=False, best=False, remove_old=True):
 
@@ -1024,7 +1151,6 @@ class Trainer(object):
         }
 
         if self.model.cuda_ray:
-            state['mean_count'] = self.model.mean_count
             state['mean_density'] = self.model.mean_density
 
         if full:
@@ -1038,17 +1164,17 @@ class Trainer(object):
 
             state['model'] = self.model.state_dict()
 
-            file_path = f"{self.ckpt_path}/{name}.pth"
+            file_path = f"{name}.pth"
 
             if remove_old:
                 self.stats["checkpoints"].append(file_path)
 
                 if len(self.stats["checkpoints"]) > self.max_keep_ckpt:
-                    old_ckpt = self.stats["checkpoints"].pop(0)
+                    old_ckpt = os.path.join(self.ckpt_path, self.stats["checkpoints"].pop(0))
                     if os.path.exists(old_ckpt):
                         os.remove(old_ckpt)
 
-            torch.save(state, file_path)
+            torch.save(state, os.path.join(self.ckpt_path, file_path))
 
         else:    
             if len(self.stats["results"]) > 0:
@@ -1064,8 +1190,8 @@ class Trainer(object):
                     state['model'] = self.model.state_dict()
 
                     # we don't consider continued training from the best ckpt, so we discard the unneeded density_grid to save some storage (especially important for dnerf)
-                    if 'density_grid' in state['model']:
-                        del state['model']['density_grid']
+                    # if 'density_grid' in state['model']:
+                    #     del state['model']['density_grid']
 
                     if self.ema is not None:
                         self.ema.restore()
@@ -1075,13 +1201,15 @@ class Trainer(object):
                 self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
             
     def load_checkpoint(self, checkpoint=None, model_only=False):
-        if checkpoint is None:
-            checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/{self.name}_ep*.pth'))
+
+        if checkpoint is None: # load latest
+            checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/*.pth')) 
+
             if checkpoint_list:
                 checkpoint = checkpoint_list[-1]
                 self.log(f"[INFO] Latest checkpoint is {checkpoint}")
             else:
-                self.log("[WARN] No checkpoint found, model randomly initialized.")
+                self.log("[WARN] No checkpoint found, abort loading latest model.")
                 return
 
         checkpoint_dict = torch.load(checkpoint, map_location=self.device)
@@ -1099,14 +1227,17 @@ class Trainer(object):
             self.log(f"[WARN] unexpected keys: {unexpected_keys}")   
 
         if self.ema is not None and 'ema' in checkpoint_dict:
-            self.ema.load_state_dict(checkpoint_dict['ema'])
+            try:
+                self.ema.load_state_dict(checkpoint_dict['ema'])
+                self.log("[INFO] loaded EMA.")
+            except:
+                self.log("[WARN] failed to loaded EMA.")
 
         if self.model.cuda_ray:
-            if 'mean_count' in checkpoint_dict:
-                self.model.mean_count = checkpoint_dict['mean_count']
             if 'mean_density' in checkpoint_dict:
                 self.model.mean_density = checkpoint_dict['mean_density']
-        
+    
+
         if model_only:
             return
 

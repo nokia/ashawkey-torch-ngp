@@ -8,21 +8,23 @@ from .utils import *
 
 
 class OrbitCamera:
-    def __init__(self, W, H, r=2, fovy=60):
+    def __init__(self, W, H, r=2, fovy=60, near=0.1, far=1000):
         self.W = W
         self.H = H
         self.radius = r # camera distance from center
         self.fovy = fovy # in degree
+        self.near = near
+        self.far = far
         self.center = np.array([0, 0, 0], dtype=np.float32) # look at this point
-        self.rot = R.from_quat([1, 0, 0, 0]) # init camera matrix: [[1, 0, 0], [0, -1, 0], [0, 0, 1]] (to suit ngp convention)
-        self.up = np.array([0, 1, 0], dtype=np.float32) # need to be normalized!
+        self.rot = R.from_matrix(np.eye(3))
+        self.up = np.array([0, 0, 1], dtype=np.float32) # need to be normalized!
 
     # pose
     @property
     def pose(self):
         # first move camera to radius
         res = np.eye(4, dtype=np.float32)
-        res[2, 3] -= self.radius
+        res[2, 3] = self.radius # opengl convention...
         # rotate
         rot = np.eye(4, dtype=np.float32)
         rot[:3, :3] = self.rot.as_matrix()
@@ -30,18 +32,34 @@ class OrbitCamera:
         # translate
         res[:3, 3] -= self.center
         return res
+
+    # view
+    @property
+    def view(self):
+        return np.linalg.inv(self.pose)
     
     # intrinsics
     @property
     def intrinsics(self):
         focal = self.H / (2 * np.tan(np.radians(self.fovy) / 2))
-        return np.array([focal, focal, self.W // 2, self.H // 2])
+        return np.array([focal, focal, self.W // 2, self.H // 2], dtype=np.float32)
+
+    # projection (perspective)
+    @property
+    def perspective(self):
+        y = np.tan(np.radians(self.fovy) / 2)
+        aspect = self.W / self.H
+        return np.array([[1/(y*aspect),    0,            0,              0], 
+                         [           0,  -1/y,            0,              0],
+                         [           0,    0, -(self.far+self.near)/(self.far-self.near), -(2*self.far*self.near)/(self.far-self.near)], 
+                         [           0,    0,           -1,              0]], dtype=np.float32)
+
     
     def orbit(self, dx, dy):
         # rotate along camera up/side axis!
         side = self.rot.as_matrix()[:3, 0] # why this is side --> ? # already normalized.
-        rotvec_x = self.up * np.radians(-0.1 * dx)
-        rotvec_y = side * np.radians(-0.1 * dy)
+        rotvec_x = self.up * np.radians(-0.05 * dx)
+        rotvec_y = side * np.radians(-0.05 * dy)
         self.rot = R.from_rotvec(rotvec_x) * R.from_rotvec(rotvec_y) * self.rot
 
     def scale(self, delta):
@@ -49,7 +67,7 @@ class OrbitCamera:
 
     def pan(self, dx, dy, dz=0):
         # pan in camera coordinate system (careful on the sensitivity!)
-        self.center += 0.0005 * self.rot.as_matrix()[:3, :3] @ np.array([dx, dy, dz])
+        self.center += 0.0005 * self.rot.as_matrix()[:3, :3] @ np.array([dx, -dy, dz])
     
 
 class NeRFGUI:
@@ -65,13 +83,12 @@ class NeRFGUI:
 
         self.trainer = trainer
         self.train_loader = train_loader
-        if train_loader is not None:
-            self.trainer.error_map = train_loader._data.error_map
 
         self.render_buffer = np.zeros((self.W, self.H, 3), dtype=np.float32)
         self.need_update = True # camera moved, should reset accumulation
         self.spp = 1 # sample per pixel
         self.mode = 'image' # choose from ['image', 'depth']
+        self.shading = 'full'
 
         self.dynamic_resolution = True
         self.downscale = 1
@@ -112,9 +129,11 @@ class NeRFGUI:
 
     def prepare_buffer(self, outputs):
         if self.mode == 'image':
-            return outputs['image']
+            return outputs['image'].astype(np.float32)
         else:
-            return np.expand_dims(outputs['depth'], -1).repeat(3, -1)
+            depth = outputs['depth'].astype(np.float32)
+            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+            return np.expand_dims(depth, -1).repeat(3, -1)
 
     
     def test_step(self):
@@ -125,7 +144,12 @@ class NeRFGUI:
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             starter.record()
 
-            outputs = self.trainer.test_gui(self.cam.pose, self.cam.intrinsics, self.W, self.H, self.bg_color, self.spp, self.downscale)
+            # mvp
+            mv = torch.from_numpy(self.cam.view).cuda() # [4, 4]
+            proj = torch.from_numpy(self.cam.perspective).cuda() # [4, 4]
+            mvp = proj @ mv
+
+            outputs = self.trainer.test_gui(self.cam.pose, self.cam.intrinsics, mvp, self.W, self.H, self.bg_color, self.spp, self.downscale, self.shading)
 
             ender.record()
             torch.cuda.synchronize()
@@ -215,19 +239,6 @@ class NeRFGUI:
                         dpg.add_button(label="start", tag="_button_train", callback=callback_train)
                         dpg.bind_item_theme("_button_train", theme_button)
 
-                        def callback_reset(sender, app_data):
-                            @torch.no_grad()
-                            def weight_reset(m: nn.Module):
-                                reset_parameters = getattr(m, "reset_parameters", None)
-                                if callable(reset_parameters):
-                                    m.reset_parameters()
-                            self.trainer.model.apply(fn=weight_reset)
-                            self.trainer.model.reset_extra_state() # for cuda_ray density_grid and step_counter
-                            self.need_update = True
-
-                        dpg.add_button(label="reset", tag="_button_reset", callback=callback_reset)
-                        dpg.bind_item_theme("_button_reset", theme_button)
-
                     # save ckpt
                     with dpg.group(horizontal=True):
                         dpg.add_text("Checkpoint: ")
@@ -242,26 +253,23 @@ class NeRFGUI:
 
                         dpg.add_text("", tag="_log_ckpt")
                     
-                    # save mesh
-                    with dpg.group(horizontal=True):
-                        dpg.add_text("Marching Cubes: ")
-
-                        def callback_mesh(sender, app_data):
-                            self.trainer.save_mesh(resolution=256, threshold=10)
-                            dpg.set_value("_log_mesh", "saved " + f'{self.trainer.name}_{self.trainer.epoch}.ply')
-                            self.trainer.epoch += 1 # use epoch to indicate different calls.
-
-                        dpg.add_button(label="mesh", tag="_button_mesh", callback=callback_mesh)
-                        dpg.bind_item_theme("_button_mesh", theme_button)
-
-                        dpg.add_text("", tag="_log_mesh")
-
                     with dpg.group(horizontal=True):
                         dpg.add_text("", tag="_log_train_log")
 
             
             # rendering options
             with dpg.collapsing_header(label="Options", default_open=True):
+
+                # # binary
+                # def callback_set_binary(sender, app_data):
+                #     if self.opt.binary:
+                #         self.opt.binary = False
+                #     else:
+                #         self.opt.binary = True
+                #     self.need_update = True
+
+                # dpg.add_checkbox(label="binary", default_value=self.opt.binary, callback=callback_set_binary)
+
 
                 # dynamic rendering resolution
                 with dpg.group(horizontal=True):
@@ -283,6 +291,13 @@ class NeRFGUI:
                     self.need_update = True
                 
                 dpg.add_combo(('image', 'depth'), label='mode', default_value=self.mode, callback=callback_change_mode)
+
+                # shading combo
+                def callback_change_shading(sender, app_data):
+                    self.shading = app_data
+                    self.need_update = True
+                
+                dpg.add_combo(('full', 'diffuse', 'specular'), label='shading', default_value=self.shading, callback=callback_change_shading)
 
                 # bg_color picker
                 def callback_change_bg(sender, app_data):
@@ -396,7 +411,7 @@ class NeRFGUI:
         with dpg.handler_registry():
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             dpg.add_mouse_wheel_handler(callback=callback_camera_wheel_scale)
-            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Right, callback=callback_camera_drag_pan)
 
         
         dpg.create_viewport(title='torch-ngp', width=self.W, height=self.H, resizable=False)

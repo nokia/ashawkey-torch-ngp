@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python main.py data/DTU/scan65 --workspace trial_ngp_dtu_scan65/ -O --bound 4 --scale 0.8 --dt_gamma 0 --data_format dtu --ckpt scratch

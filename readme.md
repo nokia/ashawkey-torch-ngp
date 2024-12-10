@@ -216,3 +216,11 @@ Using this code, please cite the following publication:
     year="2025",
 }
 ```
+
+# License
+
+The content of this repository is licensed with the BSD-3-Clause-Clear license. For the full text of the license consult
+with the [LICENSE](LICENSE) file. 
+
+The origin of the codebase is [ashawkey/torch-ngp](https://github.com/ashawkey/torch-ngp) what is licensed with the
+[MIT](https://github.com/ashawkey/torch-ngp/blob/main/LICENSE) license. 
